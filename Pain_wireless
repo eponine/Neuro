@@ -1,0 +1,682 @@
+#define F_CPU 16000000UL  
+#define Mice_number  1
+/*
+	Mice number
+	nickname: Pararing
+*/
+
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+//define PORT PINs.
+#define EN		0	// PORTF.0
+#define LCD_RS 	5   // PORTD.5
+#define LCD_RW 	6   // PORTD.6
+#define LOW_CLK 6	// PORTC.6
+#define LCD_E 	7   // PORTD.7
+#define PULSEMODE	2 	// PORTE.2
+#define WIRELESS	3	// PORTE.3
+#define CS		7 	//PORTC.7
+#define INTER	5	//PORTC.5
+#define MONO	4	//PORTD.4
+//define 
+#define BEGIN_SIGN 'a'		//buffer[0] value : Notify "It's the beginning of Telecommunication"
+//define LCD protocol
+#define LCD_CLR 	0x01  // Clear Display
+#define LCD_HOME 	0x02 // Return Home
+#define LCD_8BIT	0x38 // Function set : 8-bit, 2line, 5*8size
+#define LCD_INC	 	0x06  // Entry mode set : increment, display freeze
+#define LCD_MOV	 	0x10  // Cursor or Display Shift : Cursor move, not shift
+#define LCD_ALL  	0x0F // Display ON/OFF : LCD display on, cursor on and blink on
+#define LCD_ON           0x08      // turn lcd/cursor on             
+#define LCD_ON_DISPLAY   0x04      // turn display on              
+#define LCD_ON_CURSOR    0x02      // turn cursor on               
+#define LCD_ON_BLINK     0x01      // cursor blink
+#define LCD_LINE1  	0x80        // cursor Pos on line 1 (or with column)
+#define LCD_LINE2  	0xC0        // cursor Pos on line 2 (or with column)
+#define LCD_LINE3	0x94		// cursor Pos on line 3 (or with column)
+#define LCD_LINE4	0xD4		// cursor Pos on line 4 (or with column)
+//STIM tuning
+/*
+	tuned dur = original dur * (STIM_dTAN)+ (STIM_dCON)
+	tuned pulserate = original pulserate * (STIM_dTAN)+ (STIM_dCON)
+*/
+#define STIM_dTAN	3.2	
+#define STIM_pTAN	3.0459
+#define STIM_dCON	0
+#define STIM_pCON	13501
+
+//function declare.
+void PORT_init(void);	//initialize PORT
+void LCD_init(void);	//initialize LCD
+void INT_init(void);	//initialize Interrupt
+void UART_init(void);
+void ADC_init(void);
+
+void LCD_base_look(void);		//LCD, how it looks like												//want to delete!! if not neccesary..
+void set_LCD_main(int mode);	//change LCD, in the main function. depending on the below CHECK_mode.
+int CHECK_mode(void);			//Check current Wireless switch ON/OFF & check PULSE_mode switch ON/OFF
+void set_mode(int mode);		//set WIRELESS(on UART& ADC),NON-WIRELESS( on PIN interrupt.),depending on the avobe CHECK-mode. 
+
+void LCD_command(unsigned char command);	//lcd command location.
+void LCD_wait(void);						//wait LCD
+unsigned char LCD_getaddr(void);			
+void LCD_putchar(unsigned char data);		//LCD, Wtrie Character,
+void LCD_write(char* dstring);				//LCD. Write String
+void LCD_amp(void);							//LCD. Write Amplitude change.
+void LCD_dur(void);							//LCD. Write duration change.
+void LCD_pulse(void);	 					//LCD. Write pulse change.
+void LCD_time(void);						//LCD. write time change.
+void LCD_inter(void);						//LCD. write inter change.
+void LCD_mono(void);						//LCD. write mono change.
+void STIM(void);							//SET PORT B,C,D, G. which is the value about STIM.
+
+void GET_LABview(void);							//In Wireless mode(current_mode >1), Save value of buffer[] at each variable(amp, pulse,dur, time,inter, mono,) 
+
+//glabal varible.
+unsigned int current_mode = 0;	//->(0:non-wirless&PULSE mode)(1:non-wirless&NORMAL mode)(2:wirless&PULSE mode )(3: wirless&NORMAL mode)
+unsigned char buffer[6]={'a',0,0,};
+unsigned int pbuf = 0;			//
+/*
+	buffer	[0]: BEGIN_SIGN('a')-> to check if it's correct.
+			[1]: Mice number
+			[2]: Amplitude.
+			[3]: Pulse rate(low 5 bit)	8th bit-> inter
+			[4]: Duration(low 5 bit) 	7th bit-> mono
+			[5]: time
+*/
+unsigned char amp	= 0;
+unsigned char pulse	= 0;
+unsigned char dur	= 0;
+unsigned int time	= 0; 
+unsigned int inter_flag = 0; //default: no interval
+unsigned int mono_flag = 1; //default: mono-ph.
+enum{SETTING_MODE, CONFIRM, SET_STATUS, SEND};	//wirless Sending& Setting States
+enum{AMP, DR, PR, TIME};						//Non- Wirless, Change Parameter States.
+char state_flag = SETTING_MODE;					//Sending& Setting States (SETTING_MODE, CONFIRM, SET_STATUS, SEND)
+char p_state_flag = AMP;						//Non- Wirless, Change Parameter States.(AMP, DR, PR, TIME)
+
+//interrtupt
+ISR(SIG_USART1_RECV)
+{	//-> UART_read: value from LABview(amp,dur,... )wiil be saved on buffer.
+	unsigned char data = UDR1; //Save UDR1 at data
+ 	
+	buffer[pbuf] = data; //Save dat at buffer[]
+
+ 	if( buffer[0] == BEGIN_SIGN) { 
+		pbuf++;
+  		if(buffer[1] == Mice_number && pbuf == 6 ) {//Xbee index 확인
+   			GET_LABview(); //buffer값을 write_data함수로 넘겨줌
+   			pbuf = 0; //reset pbuf
+  		}	 
+ 	}
+ 	else { //rx error handling
+  		pbuf = 0;
+ 	}
+}
+ISR(SIG_INTERRUPT1){ // SET/YES button -> CNFIRM/ SETTING_MODE state.
+	cli();
+ 	EIFR |= (1<<INTF1);					
+	_delay_ms(170);
+	//check States.
+	if(state_flag == SETTING_MODE){
+		EIMSK = 0b00000110; //enable SET/YES,NO/RESET
+		if(current_mode>1){				//wireless mode.
+			//save buffer[] at amp, dur, pulse, time, mono, inter
+			GET_LABview();
+			//write value on LCD.
+			LCD_amp();
+			LCD_dur();
+			LCD_pulse();	 
+			LCD_time();
+			LCD_inter();
+		}
+		//LCD to "(Yes/No?)", remove Cursor.
+		LCD_command(LCD_LINE2);	LCD_putchar(' ');
+		LCD_command(LCD_LINE3);	LCD_putchar(' ');
+		LCD_command(LCD_LINE4);	LCD_putchar(' ');
+		LCD_command(LCD_LINE2|10); LCD_putchar(' ');
+		LCD_command(LCD_LINE1|0x0B);LCD_write("(Yes/No?)");
+		LCD_command(LCD_LINE1|19);
+		//change to next State.
+		state_flag = CONFIRM;
+	}
+	else if(state_flag == CONFIRM) {
+		EIMSK = 0b00001100; //enable NO/RESET, SEND/STOP
+		//LCD to "(  set  )"
+		LCD_command(LCD_LINE1|0x0B); LCD_write("(  set  )");
+		// SET stim. CS off.
+		STIM();
+		state_flag = SET_STATUS; 
+	}
+	LCD_command(LCD_LINE1|19);
+	EIFR |= (1<<INTF1);
+	sei();
+}
+ISR(SIG_INTERRUPT2){ // NO/RESET button  
+	cli();
+ 	EIFR |= (1<<INTF2);
+	_delay_ms(170);
+	if((state_flag == CONFIRM) || (state_flag == SET_STATUS) || (state_flag == SEND)) {
+		PORTC &= ~(1<<CS);// set CS low
+		//LCD to "(setting)"
+		LCD_command(LCD_LINE1|0x0B);LCD_write("(setting)");
+		LCD_command(LCD_LINE2);	LCD_putchar('>');
+		p_state_flag = AMP;
+		state_flag = SETTING_MODE;
+		//check mode.
+		if(current_mode<2){		//non-wireless.
+			EIMSK = 0b11110011;	//enable DOWN,SET/YES,PARAM,INTER,BI/MONO,UP
+		}else{					//wireless mode.
+			//enable interrupt about,SET/YES:1
+    		EIMSK = 0b00000010;
+		}
+	}
+    EIFR |= (1<<INTF2);
+    sei();
+}
+ISR(SIG_INTERRUPT3){ // SEND/STOP button
+	cli();
+ 	EIFR |= (1<<INTF3);
+	_delay_ms(170);
+	if(state_flag == SET_STATUS) {
+		EIMSK = 0b00001100; //enable NO/RESET, SEND/STOP
+		//LCD to "(sending)"
+		LCD_command(LCD_LINE1|0x0B);LCD_write("(sending)");
+		LCD_command(LCD_LINE1|19);
+		if((current_mode)<2){//non-wiremode.
+			if((current_mode %2) == 1) { //NORMAL MODE
+			PORTC |= (1<<CS);// set CS high
+			state_flag = SEND; 
+			}	
+			else { //PULSE MODE
+			unsigned int i = 0;
+			PORTC |= (1<<CS);// set CS high
+			for(i=0;i<time;i++) {
+	       	    _delay_ms(100);
+				}			
+			PORTC &= ~(1<<CS);// set CS low
+			//LCD to "(  set  )"
+			//avr stim output
+
+			state_flag = SET_STATUS;
+			}
+		}
+	}
+	else if(state_flag == SEND) {
+		EIMSK = 0b00001100; //enable NO/RESET, SEND/STOP
+		if((current_mode %2) == 1) { //NORMAL MODE
+			PORTC &= ~(1<<CS);// set CS low
+			//LCD to(  set  )"
+			LCD_command(LCD_LINE1|0x0B);LCD_write("(  set  )");
+			STIM();//avr stim output
+			//avr stim output
+			state_flag = SET_STATUS;
+			}
+	}
+	LCD_command(LCD_LINE1|19);  
+    EIFR |= (1<<INTF3);
+    sei(); 
+}
+ISR(SIG_INTERRUPT4){  //PARAM button, only for changing LCD, and p_state_flag.
+	cli();
+ 	EIFR |= (1<<INTF4);
+	_delay_ms(170);
+	if(state_flag == SETTING_MODE) {	
+		if((current_mode)<2){
+			EIMSK = 0b11110011;    //enable DOWN,SET/YES,PARAM,INTER,BI/MONO,UP
+				
+			if(p_state_flag == AMP) {
+				LCD_command(LCD_LINE2);	LCD_putchar(' ');
+				LCD_command(LCD_LINE3);	LCD_putchar('>');
+				LCD_command(LCD_LINE3);
+				p_state_flag = DR;	
+			}
+			else if(p_state_flag == DR) {
+				LCD_command(LCD_LINE3);	LCD_putchar(' ');	
+				LCD_command(LCD_LINE4);	LCD_putchar('>');
+				LCD_command(LCD_LINE4);
+				p_state_flag = PR;
+			}
+			else if(p_state_flag == PR) {
+				LCD_command(LCD_LINE4);	LCD_putchar(' ');
+				if((current_mode%2) == 1) {//normal mode
+					LCD_command(LCD_LINE2);	LCD_putchar('>');
+					LCD_command(LCD_LINE2);
+					p_state_flag = AMP;
+				}else if((current_mode%2) == 0) {//pulse mode 
+					LCD_command(LCD_LINE2|10); LCD_putchar('>');
+					LCD_command(LCD_LINE2|10);
+					p_state_flag = TIME;
+				}
+			}
+			else if(p_state_flag == TIME) {
+				LCD_command(LCD_LINE2|10); LCD_putchar(' ');
+				LCD_command(LCD_LINE2);	LCD_putchar('>');
+				LCD_command(LCD_LINE2);			
+				p_state_flag = AMP;
+			}
+		}
+	}	
+    EIFR |= (1<<INTF4);
+    sei();  	
+}
+ISR(SIG_INTERRUPT5){	// INTER button
+    cli();
+ 	EIFR |= (1<<INTF5);
+	_delay_ms(180);
+	LCD_inter();
+    EIFR |= (1<<INTF5);
+    sei();
+}
+ISR(SIG_INTERRUPT6){	// BI/MONO button
+    cli();
+ 	EIFR |= (1<<INTF6);
+	_delay_ms(180);
+	if(state_flag == SETTING_MODE) {			
+		if((current_mode)<2){	//normal mode.
+			EIMSK = 0b11110011;    //enable DOWN,SET/YES,PARAM,INTER,BI/MONO,UP
+			LCD_mono();
+		}else{
+			//enable interrupt about,SET/YES:1
+    		EIMSK = 0b00000010;
+		}		
+	}
+    EIFR |= (1<<INTF6);
+    sei();
+}
+ISR(SIG_INTERRUPT7){    //UP button 
+    cli();
+ 	EIFR |= (1<<INTF7);
+	_delay_ms(160);
+    if(state_flag == SETTING_MODE) {    
+        if((current_mode)<2){		//NON-wireless mode.
+			EIMSK = 0b11110011;    //enable DOWN,SET/YES,PARAM,INTER,BI/MONO,UP
+			if(p_state_flag == AMP) {
+	            if(amp>6) {
+					amp=0;
+				}
+				else {
+					amp++;
+				}
+				LCD_amp();
+	        }
+	        else if(p_state_flag == DR) {
+	            dur++;
+	            LCD_dur();
+	        }
+	        else if(p_state_flag == PR) {
+	            pulse++;
+	           	LCD_pulse();
+	        }
+	        else if(p_state_flag == TIME) {
+	            time++;
+	        	LCD_time();
+	        }
+		}else{								//WIRELESS mode.
+			//enable interrupt about,SET/YES:1
+    		EIMSK = 0b00000010;
+		}
+    }  
+	EIFR |= (1<<INTF7);
+    sei();
+}	
+ISR(SIG_INTERRUPT0){    //DOWN button 
+    cli();
+ 	EIFR |= (1<<INTF0);
+	_delay_ms(160);
+    if(state_flag == SETTING_MODE) {
+        EIMSK = 0b11110011;    //enable DOWN,YES,PARAM,INTER,BI/MONO,UP                
+        if(p_state_flag == AMP) {
+            if(amp==0) {
+				amp=7;
+			}
+			else {
+				amp--;
+			}
+            LCD_amp();
+        }
+        else if(p_state_flag == DR) {
+            dur--;
+            LCD_dur();
+        }
+        else if(p_state_flag == PR) {
+            pulse--;
+            LCD_pulse();
+        }
+        else if(p_state_flag == TIME) {
+            if(time%101 == 0) {
+                time = 100;
+            }
+            else {
+            time--;
+            }
+            LCD_time();
+        }    
+    }
+    EIFR |= (1<<INTF0);
+    sei();
+}
+//main
+int main(){
+	int pre_mode = 0;	//variable for mode checking.
+	cli();
+	//initialize 
+	PORT_init();
+  	LCD_init();
+	INT_init();
+	UART_init();
+	ADC_init();
+
+	LCD_base_look();
+	sei();				//interrupt enable
+	while(1){
+		//check NORMAL/ PULSE mode 
+		current_mode =  CHECK_mode();
+		//Mode is changed.
+		if(pre_mode != current_mode){	
+			//set LCD, whether (WIRELESS/ NORMAL/ PULSE) mode.
+			set_LCD_main(current_mode);
+			//set AVR, whether (WIRELESS, non-wire) mode.
+			set_mode(current_mode);
+			// change pre_mode after new settings.
+			pre_mode = current_mode;
+		} 		
+	}
+}
+
+//function definition
+void PORT_init(){
+	DDRA = 0xff; 	// DB:0~7
+	PORTA = 0x00;
+	
+	DDRB = 0xff;	// A:0~7
+	PORTB = 0x00; 	//
+
+	DDRC = 0xff;	// P:0~4; inter:5; LOW_CLK:6; CS:7 
+	PORTC = 0b00000000; 	
+
+	DDRD = 0xf0;	// DOWN:0; SET/YES:1; NO/RESET:2; SEND/STOP:3; 
+	PORTD = 0x00;	// mono:4; RS:5; RW:6; E:7	
+
+	DDRE = 0b00000001; 	// DOUT:0; DIN:1; pulsemode:2; wireless:3;
+	PORTE = 0x00;		// PARAM:4; INTER:5; BI/MONO:6; UP:7
+	
+	DDRF = 0x00; // EN:0
+	PORTF = 0x00;
+	 
+	DDRG = 0b00011111;//duration
+ 	PORTG = 0x00;
+}
+
+void INT_init(){
+	//enable 0:DOWN; 1:SET/YES; 4:PARAM; 5:INTER; 6:BI/MONO; 7:UP
+	EIMSK = 0b11110011; 
+	EICRA = 0xff; 	//rising edge
+	EICRB = 0xff;	//rising edge
+}
+void UART_init(void){
+	UCSR1B = (1<<RXCIE1) | (1<<RXEN1) |  (1<<TXEN1); //RX/TX enable, RXC interrupt enable
+ 	UCSR1C = (1<<UCSZ11) | (1<<UCSZ10); //no parity, 1 stop, 8 data
+ 	UBRR1L = 103; //9600bps
+}
+
+void ADC_init()
+{
+ 	ADMUX |= (1 << REFS0) | (1 << ADLAR);
+	//ADC0 select
+	//Standard Voltage: External avcc Voltage.
+	//left result control.
+ 	ADCSRA |= (1 << ADEN) | (1 << ADSC) | (1 << ADFR) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+	// Enable ADC
+	// Start A2D C`onversions
+	// Set ADC to Free-Running Mode
+	// division factor 2
+}
+
+void LCD_base_look(){												//want to delete!! if not neccesary..
+	LCD_command(LCD_LINE1);LCD_write("NORMALmode");
+  	LCD_command(LCD_LINE2 | 1);LCD_write("Amp    uA");
+	LCD_command(LCD_LINE2 | 11);LCD_write("Time inf.");
+	LCD_command(LCD_LINE3 | 1);LCD_write("Dr     us");
+	LCD_command(LCD_LINE3 | 10);LCD_write("-MONO");
+	LCD_command(LCD_LINE4 | 1);LCD_write("Pr     us");
+	LCD_command(LCD_LINE4 | 10);LCD_write("-IntervalX");
+	LCD_command(LCD_LINE1|0x0B);LCD_write("(setting)");
+	LCD_command(LCD_LINE2);	LCD_putchar('>');
+	LCD_command(LCD_LINE2);
+}
+void set_LCD_main(int mode){
+	switch(mode){
+		case 0: 					//non- wirless&PULSE mode.
+			LCD_command(LCD_LINE1);LCD_write("PULSE mode ");
+			LCD_command(LCD_LINE2 | 16);LCD_write(" . s");
+			LCD_time();
+		break;
+		case 1: 					//non- wirless&NORMAL mode.
+			LCD_command(LCD_LINE1);LCD_write("NORMALmode");
+			LCD_command(LCD_LINE2 | 15);LCD_write(" inf.");
+		break;
+		case 2:  					//wirless&PULSE mode.
+			LCD_command(LCD_LINE1);LCD_write("PULSE mode ");
+			LCD_command(LCD_LINE1 | 9);LCD_write("W");
+			LCD_command(LCD_LINE2 | 16);LCD_write(" . s");
+			LCD_time();
+		break;
+		case 3:  					//wirless&NORMAL mode.
+			LCD_command(LCD_LINE1 | 9);LCD_write("W");
+			LCD_command(LCD_LINE1);LCD_write("NORMALmode");
+			LCD_command(LCD_LINE2 | 15);LCD_write(" inf.");
+		break;
+		default: break;
+	}
+	
+}
+int CHECK_mode(void){
+	if( (PINE & 0x08) == 0x08){	//wireless switch is on/off, Wirless mode ON: 1, OFF: 0
+		if( (PINE & 0x04) == 0x04 ){	
+			return 3;				//wirless&NORMAL mode.
+		}
+		else{	
+			return 2;				//wirless&PULSE mode.
+		}
+		return 0;	
+	}else{
+		if( (PINE & 0x04) == 0x04 ){	
+			return 1;				//non- wirless&NORMAL mode.
+		}
+		else{	
+			return 0;				//non- wirless&PULSE mode.
+		}
+	}
+}
+void set_mode(int mode){
+	if(mode>1){		//Wireless mode
+		//enable interrupt about,SET/YES:1
+    	EIMSK = 0b00000010;
+	}else{			//non-Wireless mode
+		//enable interrupt about, DOWN:0; SET/YES:1; PARAM:4; INTER:5; BI/MONO:6; UP:7
+    	EIMSK = 0b11110011;
+	}			
+}
+
+void LCD_init(void){
+	//setup the LCD control signals on PortD  (RS, RW and Enable as output)
+	DDRD |= ((1<<LCD_RS)|(1<<LCD_RW)|(1<<LCD_E));
+	PORTD &= ~((1<<LCD_RS)|(1<<LCD_RW)|(1<<LCD_E));// set both low
+	// data Port A as output
+	DDRA = 0xFF;
+	PORTA = 0x00;
+	_delay_us(50);
+    LCD_command(LCD_CLR);       // clear display	
+	LCD_command(LCD_8BIT);      // set 8 data bits  
+	LCD_command(LCD_INC);       // cursor increments automatically 
+	LCD_command(LCD_MOV);       // cursor  set to move
+	//LCD_command(LCD_ALL);     // can call all instead of next line
+	LCD_command(LCD_ON | LCD_ON_DISPLAY | LCD_ON_CURSOR | LCD_ON_BLINK);
+	LCD_command(LCD_LINE1); // set cursor to  row 1, position 0
+}
+void LCD_command(unsigned char command){
+	
+	_delay_ms(1);
+
+	PORTD	&=	~(1<<LCD_RS);	// RS, RW low for Command
+	PORTD 	&= 	~(1<<LCD_RW);  	
+	PORTD 	|= 	 (1<<LCD_E);    // Enable pin high
+	_delay_ms(2);
+	PORTA = command;        	// put data on Port
+	PORTD &= ~(1<<LCD_E);   	//Enable Pin Low
+}
+void LCD_putchar(unsigned char data){
+	_delay_ms(1);
+	PORTD	|=	 (1 << LCD_RS);   	//RS=1, R/W=0 for data write
+	PORTD 	&= 	~(1 << LCD_RW); 
+	PORTD 	|=	 (1 << LCD_E);    	//Enable high
+	_delay_us(50);
+	PORTA = data;					//put data on bus
+	_delay_us(50);
+	PORTD    &= ~(1 << LCD_E);    	// Enable low again
+	PORTD    &= ~(1 << LCD_RS);
+}
+void LCD_write(char* dstring){
+	//is the character pointed at by dstring a zero? If not, write character to LCD
+	while(*dstring)
+	{		
+	// write the character from dstring to the LCD, then post-inc the string pointer.
+	       LCD_putchar(*dstring++);
+	}
+}
+void LCD_amp(void){
+	LCD_command(LCD_LINE2 | 6);LCD_write("00");
+	unsigned int tem[1];
+	char amp_temp = amp;		
+	for(int i = 0; i<1;i++){
+		tem[i] = amp_temp%10;
+		amp_temp /= 10;
+		LCD_command(LCD_LINE2 | (5-i));
+		LCD_putchar((tem[i]+48));
+	}
+	LCD_command(LCD_LINE2);
+}
+void LCD_dur(void){
+	dur %= 32;
+	unsigned char tem[5];
+	long dur_temp = 16*dur*STIM_dTAN+STIM_dCON;		
+	for(int i = 0; i<5;i++){
+		tem[i] = (dur_temp)%10;
+		dur_temp /= 10;
+		LCD_command(LCD_LINE1 | (27-i));
+		LCD_putchar((tem[i]+48));
+	}
+	LCD_command(LCD_LINE3);
+}
+void LCD_pulse(void){
+	pulse %= 32;
+	unsigned char tem[5];
+	long pulse_temp = 512*pulse*STIM_pTAN+STIM_pCON;	
+	for(int i = 0; i<5;i++){
+		tem[i] = (pulse_temp)%10;
+		pulse_temp /= 10;
+		LCD_command(LCD_LINE2 | (27-i));
+		LCD_putchar((tem[i]+48));
+	}
+	LCD_command(LCD_LINE4);
+}
+void LCD_time(){
+	time %= 101;
+	unsigned char tem[3];
+	unsigned int time_temp = time;		
+	for(int i = 0; i<3;i++){
+		tem[i] = time_temp%10;
+		time_temp /= 10;
+
+		if(i == 0){
+			LCD_command(LCD_LINE2 | 18);	
+			LCD_putchar((tem[i]+48));
+		}else if(i == 1){
+			LCD_command(LCD_LINE2 | 16);
+			LCD_putchar((tem[i]+48));
+		}
+		else if(i == 2){
+			LCD_command(LCD_LINE2 | 15);
+			LCD_putchar((tem[i]+48));
+		}
+	}
+	LCD_command(LCD_LINE2|10);
+}
+void LCD_inter(void){
+	if(inter_flag == 0) {
+		inter_flag = 1;
+		LCD_command(LCD_LINE2 | 0x27);LCD_write("O");
+		LCD_command(LCD_LINE2 | 0x27);
+	}
+	else if(inter_flag == 1) {
+		inter_flag = 0;
+		LCD_command(LCD_LINE2 | 0x27);LCD_write("X");
+		LCD_command(LCD_LINE2 | 0x27);
+	}
+}
+void LCD_mono(void){
+	if(mono_flag == 0) {
+		mono_flag = 1; //set mono-ph.
+		LCD_command(LCD_LINE3 | 10);LCD_write("-MONO  ");
+	}		
+	else if(mono_flag == 1) {
+		mono_flag = 0; //set bi-ph.
+		LCD_command(LCD_LINE3 | 10);LCD_write("-bi-ph.");
+	}
+}
+void STIM(void){
+	//initialize stim value
+	PORTC |=0b00011111; //pulse
+ 	PORTG |=0b11111111; //dur 
+	//stim value
+	switch(amp) {
+		case 0:PORTB=~0b00000000;break;
+		case 1:PORTB=~0b00010010;break;//18(100) 
+		case 2:PORTB=~0b00101001;break;//41(200)
+		case 3:PORTB=~0b00111100;break;//60(300) 
+		case 4:PORTB=~0b01000110;break;//70(400) 
+		case 5:PORTB=~0b1010110;break;//86(500)
+		case 6:PORTB=~0b01101100;break;//108(600) 
+		case 7:PORTB=~0b01111010;break;//122(700) 
+	}
+	PORTC &= ~(pulse);
+	PORTG &= ~(dur);
+		//inter
+	if(inter_flag == 0){
+		PORTC |= (1<<INTER);// set inter low
+	}
+	else{
+		PORTC &= ~(1<<INTER);// set inter high
+	}
+	//bi/mono
+	if(mono_flag == 0){
+		PORTD |= (1<<MONO);// set mono low
+	}
+	else{
+		PORTD &= ~(1<<MONO);// set mono high
+	}
+		
+}
+void GET_LABview(){
+	//save Amplitude value
+	amp = buffer[2];
+	//save Pulserate, and inter_flag.
+	if(buffer[3]<32){	//inter off. 
+		pulse = buffer[3];
+		inter_flag =0;
+	}else{
+		pulse = (buffer[3])%32;
+		inter_flag =1;
+	}
+	//save Pulserate, and inter_flag.
+	if(buffer[4]<32){	//mono_off. 
+		dur = buffer[4];
+		mono_flag = 0;
+	}else{
+		dur = (buffer[4])%32;
+		mono_flag = 1;
+	}
+	time = buffer[5];
+}
